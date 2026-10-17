@@ -1,0 +1,74 @@
+name: Publish signed JARVIS release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release tag, e.g. v3.9.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: jarvis-release
+  cancel-in-progress: false
+
+jobs:
+  verify-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install verifier
+        run: python -m pip install 'cryptography>=43,<47'
+      - name: Verify locally signed release candidate
+        env:
+          RELEASE_TAG: ${{ inputs.version }}
+        run: |
+          python - <<'PY'
+          import os, re, base64, hashlib, zipfile
+          from pathlib import Path
+          from cryptography.hazmat.primitives import serialization
+          tag=os.environ['RELEASE_TAG']
+          if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+',tag):
+              raise SystemExit('Invalid version tag')
+          root=Path('release-candidates')/tag
+          archive=root/f'JARVIS_{tag}_Windows.zip'
+          signature=Path(str(archive)+'.sig')
+          public=Path('publisher-public.pem')
+          for p in (archive,signature,public):
+              if not p.is_file(): raise SystemExit(f'Missing required file: {p}')
+          key=serialization.load_pem_public_key(public.read_bytes())
+          key.verify(base64.b64decode(signature.read_text().strip(),validate=True),archive.read_bytes())
+          with zipfile.ZipFile(archive) as z:
+              if z.testzip(): raise SystemExit('Invalid ZIP')
+              for name in z.namelist():
+                  parts=Path(name).parts
+                  if (not parts or parts[0]!='JARVIS' or '..' in parts or name.startswith('/')):
+                      raise SystemExit('Unexpected ZIP entry: '+name)
+                  if any(x in ('.env','.venv','.git','publisher-private.pem') for x in parts):
+                      raise SystemExit('Potential secret or local file in archive: '+name)
+          digest=hashlib.sha256(archive.read_bytes()).hexdigest()
+          Path('/tmp/jarvis-sha256').write_text(digest)
+          print('Ed25519 signature valid; SHA-256:',digest)
+          PY
+      - name: Publish verified release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.version }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release already exists; refusing overwrite."
+            exit 1
+          fi
+          asset="release-candidates/$RELEASE_TAG/JARVIS_${RELEASE_TAG}_Windows.zip"
+          digest="$(cat /tmp/jarvis-sha256)"
+          gh release create "$RELEASE_TAG" "$asset" "$asset.sig" \
+            --title "JARVIS $RELEASE_TAG" --latest \
+            --notes "Signed JARVIS release. SHA-256: $digest. Paper trading only. Installation requires user approval."
